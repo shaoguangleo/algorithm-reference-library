@@ -315,8 +315,25 @@ def w_kernel(field_of_view, w, npixel_farfield, npixel_kernel, kernel_oversampli
     return kernel_oversample(wbeamarray, npixel_farfield, kernel_oversampling, npixel_kernel)
 
 
+@numba.generated_jit(nopython=True, nogil=True, cache=True)
+def to_int(x):
+    """A simple workaround for the fact that NUMBA does not seem to have a
+    way to write a function that converts from floats to integers for
+    *both* numpy arrays and flat values.
+
+    :param x: Input float value(s)
+    :return: Output integer value(s)
+    """
+
+    if isinstance(x, types.Float):
+        return lambda x: numpy.int_(x)
+    else:
+        return lambda x: x.astype(numpy.int_)
+
+
 @numba_jit
 def frac_coord(npixel, kernel_oversampling, p):
+
     """ Compute whole and fractional parts of coordinates, rounded to
     kernel_oversampling-th fraction of pixel size
 
@@ -332,7 +349,7 @@ def frac_coord(npixel, kernel_oversampling, p):
     x = npixel // 2 + p * npixel
     flx = numpy.floor(x + 0.5 / kernel_oversampling)
     fracx = numpy.floor((x - flx) * kernel_oversampling + 0.5)
-    return flx.astype(numpy.int_), fracx.astype(numpy.int_)
+    return to_int(flx), to_int(fracx)
 
 
 @numba_jit
@@ -350,6 +367,37 @@ def frac_coords(shape, kernel_oversampling, xycoords):
 
 
 @numba_jit
+def fixed_kernel_degrid_single(kernel, uvgrid, uvs, vis=None):
+    """Convolutional degridding with frequency and polarisation independent
+
+    Takes into account fractional `uv` coordinate values where the GCF
+    is oversampled
+
+    :param kernel: Oversampled convolution kernel
+    :param uvgrid: The uv plane to de-grid from
+    :param uv: fractional uv coordinates in range[-0.5,0.5[
+    :param vis: Output numpy array for writing visibilities (optional)
+    :returns: Array of visibilities.
+    """
+    kernel_oversampling, _, gh, gw = kernel.shape
+
+    # ... why?
+    #assert gh % 2 == 0, "Convolution kernel must have even number of pixels"
+    #assert gw % 2 == 0, "Convolution kernel must have even number of pixels"
+
+    ny, nx = uvgrid.shape
+    if vis is None:
+        nvis, _ = uvs.shape
+        vis = numpy.empty(nvis, dtype=uvgrid.dtype)
+    for n, (u, v) in enumerate(zip(uvs[:,0], uvs[:,1])):
+        y, yf = frac_coord(ny, kernel_oversampling, v)
+        x, xf = frac_coord(nx, kernel_oversampling, u)
+        vis[n] = numpy.sum(uvgrid[y - gh // 2: y + (gh + 1) // 2,
+                                  x - gw // 2: x + (gw + 1) // 2]
+                           * kernel[yf, xf])
+    return vis
+
+
 def fixed_kernel_degrid(kernel, uvgrid, uv, uvscale):
     """Convolutional degridding with frequency and polarisation independent
 
@@ -363,27 +411,55 @@ def fixed_kernel_degrid(kernel, uvgrid, uv, uvscale):
     :returns: Array of visibilities.
     """
     kernel_oversampling, _, gh, gw = kernel.shape
-    assert gh % 2 == 0, "Convolution kernel must have even number of pixels"
-    assert gw % 2 == 0, "Convolution kernel must have even number of pixels"
+
+    # Allocate output arrays
     nchan, npol, ny, nx = uvgrid.shape
     nvis, _ = uv.shape
     vis = numpy.empty((nvis, nchan, npol), dtype=numpy.complex_)
     wt = numpy.empty((nvis, nchan, npol))
+
+    # Dummy grid to degrid weights from
+    wtgrid = numpy.ones((ny, nx))
+
     for chan in range(nchan):
-        ys, yfs = frac_coord(uvgrid.shape[2], kernel_oversampling, uvscale[1, chan] * uv[..., 1])
-        xs, xfs = frac_coord(uvgrid.shape[3], kernel_oversampling, uvscale[0, chan] * uv[..., 0])
+        uvs = uv[:,0:2] * uvscale[0:2,chan]
         for pol in range(npol):
-            for n, (x, xf, y, yf) in enumerate(zip(xs, xfs, ys, yfs)):
-                vis[n, chan, pol] = \
-                    numpy.sum(uvgrid[chan, pol,
-                                     y - gh // 2: y + (gh + 1) // 2,
-                                     x - gw // 2: x + (gw + 1) // 2]
-                              * kernel[yf, xf])
-                wt[n, chan, pol] = numpy.sum(kernel[yf, xf].real)
+            fixed_kernel_degrid_single(kernel, uvgrid[chan, pol], uvs,
+                                       vis[:,nchan,npol])
+            fixed_kernel_degrid_single(kernel.real, wtgrid, uvs,
+                                       wt[:,nchan,npol])
+
     return numpy.where(wt > 0, vis / wt, numpy.zeros_like(vis))
 
 
 @numba_jit
+def fixed_kernel_grid_single(kernel, uvgrid, uvs, viswt):
+    """Grid after convolving with a constant GCF
+
+    Takes into account fractional `uv` coordinate values where the GCF
+    is oversampled
+
+    :param kernel: Oversampled convolution kernel
+    :param uvgrid: Grid to add to
+    :param uv: Scaled UVW positions
+    :param viswt: Weighted visibility values
+    """
+
+    kernel_oversampling, _, gh, gw = kernel.shape
+
+    # ... why?
+    # assert gh % 2 == 0, "Convolution kernel must have even number of pixels"
+    # assert gw % 2 == 0, "Convolution kernel must have even number of pixels"
+
+    ny, nx = uvgrid.shape
+    for vi, u, v in zip(viswt, uvs[:,0], uvs[:,1]):
+        y, yf = frac_coord(ny, kernel_oversampling, v)
+        x, xf = frac_coord(nx, kernel_oversampling, u)
+        uvgrid[(y - gh // 2):(y + (gh + 1) // 2),
+               (x - gw // 2):(x + (gw + 1) // 2)] \
+            += kernel[yf, xf] * vi
+    return uvgrid
+
 def fixed_kernel_grid(kernel, uvgrid, uv, uvscale, vis, visweights):
     """Grid after convolving with frequency and polarisation independent gcf
 
@@ -398,26 +474,18 @@ def fixed_kernel_grid(kernel, uvgrid, uv, uvscale, vis, visweights):
     :param vis: Visibility weights
     """
 
-    kernel_oversampling, _, gh, gw = kernel.shape
-    assert gh % 2 == 0, "Convolution kernel must have even number of pixels"
-    assert gw % 2 == 0, "Convolution kernel must have even number of pixels"
-    nchan, npol, ny, nx = uvgrid.shape
+    # Grid visibilities & weights
+    nchan, npol, _, _ = uvgrid.shape
     wtgrid = numpy.zeros(uvgrid.shape, dtype=numpy.float_)
-    sumwt = numpy.zeros((nchan, npol))
     for chan in range(nchan):
-        ys, yfs = frac_coord(ny, kernel_oversampling, uvscale[1, chan] * uv[..., 1])
-        xs, xfs = frac_coord(nx, kernel_oversampling, uvscale[0, chan] * uv[..., 0])
+        uvs = uv[:,0:2] * uvscale[0:2,chan]
         for pol in range(npol):
-            wts = visweights[..., chan, pol]
-            viswt = vis[..., chan, pol] * visweights[..., chan, pol]
-            for v, vwt, x, xf, y, yf in zip(viswt, wts, xs, xfs, ys, yfs):
-                uvgrid[chan, pol, (y - gh // 2):(y + (gh + 1) // 2), (x - gw // 2):(x + (gw + 1) // 2)] \
-                    += kernel[yf, xf, :, :] * v
-                wtgrid[chan, pol, (y - gh // 2):(y + (gh + 1) // 2), (x - gw // 2):(x + (gw + 1) // 2)] \
-                    += kernel[yf, xf, :, :].real * vwt
-            sumwt[chan, pol] += numpy.sum(wtgrid[chan, pol, ...])
-    
-    return uvgrid, sumwt
+            fixed_kernel_grid_single(kernel, uvgrid[chan, pol], uvs,
+                                     vis[:,chan,pol] * visweights[:,chan,pol])
+            fixed_kernel_grid_single(kernel.real, wtgrid[chan, pol], uvs,
+                                     visweights[:,chan,pol])
+
+    return uvgrid, numpy.sum(wtgrid, axis=(2,3))
 
 
 @numba_jit
@@ -453,7 +521,6 @@ def box_grid(kernel, uvgrid, uv, uvscale, vis, visweights):
     return uvgrid, sumwt
 
 
-@numba_jit
 def weight_gridding_uniform(shape, uv, uvscale, visweights):
     """Reweight data using uniform weighting
 
@@ -469,30 +536,26 @@ def weight_gridding_uniform(shape, uv, uvscale, visweights):
 
     nchan, npol, ny, nx = shape
     densitygrid = numpy.zeros(shape)
+    delta_kernel = numpy.ones((1,1,1,1))
 
     # Add all visibility points to a float grid
     for chan in range(nchan):
-        ys, _ = frac_coord(ny, 1, uvscale[1, chan] * uv[..., 1])
-        xs, _ = frac_coord(nx, 1, uvscale[0, chan] * uv[..., 0])
         for pol in range(npol):
-            wts = visweights[..., chan, pol]
-            for wt, x, y, in zip(wts, xs, ys):
-                densitygrid[chan, pol, y, x] += wt
-            # for i in range(visweights[..., chan, pol].shape[0]):
-            #     densitygrid[chan, pol, y[i], x[i]] += wts[i]
+            fixed_kernel_grid_single(delta_kernel,
+                                     densitygrid[chan, pol],
+                                     uv[:,0:2] * uvscale[0:2,chan],
+                                     visweights[:,chan,pol])
 
     # Normalise each visibility weight to sum to one in a grid cell
     density = numpy.zeros_like(visweights)
-    newvisweights = numpy.zeros_like(visweights)
     for chan in range(nchan):
-        ys, _ = frac_coord(ny, 1, uvscale[1, chan] * uv[..., 1])
-        xs, _ = frac_coord(nx, 1, uvscale[0, chan] * uv[..., 0])
         for pol in range(npol):
-            wts = visweights[..., chan, pol]
-            for n, (wt, x, y) in enumerate(zip(wts, xs, ys)):
-                density[n, chan, pol] += densitygrid[chan, pol, y, x]
-                if densitygrid[chan, pol, y, x] > 0.0:
-                    newvisweights[n, chan, pol] = wt / densitygrid[chan, pol, y, x]
+            fixed_kernel_degrid_single(delta_kernel,
+                                       densitygrid[chan, pol],
+                                       uv[:,0:2] * uvscale[0:2,chan],
+                                       density[:,chan,pol])
+
+    newvisweights = numpy.where(density > 0, visweights / density, numpy.zeros_like(visweights))
     return newvisweights, density, densitygrid
 
 def weight_gridding(shape, uv, uvscale, visweights, weighting='uniform'):

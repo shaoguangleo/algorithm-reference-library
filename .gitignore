@@ -38,6 +38,7 @@ psf.fits
 arl_fourier_processing.xlsx
 functions_status.xlsx
 /.cache
+__pycache__
 /docs/crocodile requirements.xlsx
 reproject_footprint.fits
 reproject_image.fits
