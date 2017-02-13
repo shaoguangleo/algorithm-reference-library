@@ -13,7 +13,6 @@ import logging
 import scipy.special
 from astropy.constants import c
 
-from arl.data.parameters import get_parameter
 from arl.fourier_transforms.fft_support import *
 
 # Use NUMBA if available
@@ -573,9 +572,7 @@ def weight_gridding(shape, uv, uvscale, visweights, weighting='uniform'):
     """
     if weighting == 'uniform':
         log.info("weight_gridding: Performing uniform weighting")
-        print(shape, numpy.array(uv), numpy.array(uvscale), numpy.array(visweights))
         newvisweights, density, densitygrid = weight_gridding_uniform(shape, uv, uvscale, visweights)
-        print(newvisweights, density)
         return newvisweights, density, densitygrid
     else:
         densitygrid = numpy.zeros(shape)
