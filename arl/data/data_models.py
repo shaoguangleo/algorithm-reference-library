@@ -4,6 +4,7 @@
 import logging
 import sys
 
+import dask
 import numpy
 from astropy import units as u
 from astropy.constants import c
@@ -109,33 +110,34 @@ class Image:
 
     """
     
-    def __init__(self):
-        """ Empty image
-        """
-        self.data = None
-        self.wcs = None
+    def __init__(self, data, wcs, shape):
+
+        self.data = dask.delayed(data)
+        self.shape = shape
+        self.dtype = numpy.dtype(float)
+        self.wcs = wcs.deepcopy()
     
     def size(self):
         """ Return size in GB
         """
         size = 0
-        size += numpy.product(self.data.shape) * self.data.dtype.itemsize
+        size += numpy.product(self.shape) * self.dtype.itemsize
         return size / 1024.0 / 1024.0 / 1024.0
     
     @property
-    def nchan(self): return self.data.shape[0]
+    def nchan(self): return self.shape[0]
     
     @property
-    def npol(self): return self.data.shape[1]
+    def npol(self): return self.shape[1]
 
     @property
-    def nheight(self): return self.data.shape[2]
+    def nheight(self): return self.shape[2]
 
     @property
-    def nwidth(self): return self.data.shape[3]
+    def nwidth(self): return self.shape[3]
 
     @property
-    def npixel(self): return self.data.shape[3]
+    def npixel(self): return self.shape[3]
     
     @property
     def frequency(self):
@@ -145,14 +147,10 @@ class Image:
         return w.wcs_pix2world(range(self.nchan), 1)[0]
     
     @property
-    def shape(self):
-        return self.data.shape
-    
-    @property
     def phasecentre(self): return SkyCoord(self.wcs.wcs.crval[0] * u.deg, self.wcs.wcs.crval[1] * u.deg)
     
     def __exit__(self):
-        log.debug("Image:Exiting from image of shape: %s" % (self.data.shape))
+        log.debug("Image:Exiting from image of shape: %s" % (self.shape))
 
 
 class Skycomponent:
@@ -266,6 +264,10 @@ class Visibility:
         for col in self.data.dtype.fields.keys():
             size += self.data[col].size * sys.getsizeof(self.data[col])
         return size / 1024.0 / 1024.0 / 1024.0
+    
+    @property
+    def shape(self):
+        return self.data.shape
     
     @property
     def nvis(self):

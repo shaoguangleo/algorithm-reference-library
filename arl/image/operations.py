@@ -33,25 +33,23 @@ def create_image_from_slice(im, imslice):
     """Create image from an image using a numpy.slice
     
     """
-    fim = Image()
-    fim.data = im.data[imslice]
-    fim.wcs = im.wcs(imslice).deepcopy()
+    fim = Image(data = im.data[imslice],
+                wcs = im.wcs(imslice))
     log.debug("create_image_from_slice: created image of shape %s, size %.3f (GB)" % (str(im.shape), image_sizeof(im)))
     return fim
 
 
-def create_image_from_array(data: numpy.array, wcs: WCS = None) -> Image:
+def create_image_from_array(data: numpy.array, shape, wcs: WCS = None) -> Image:
     """ Create an image from an array
 
     :rtype: Image
-    :param data:
+    :param data: future for data
+    :param shape: data shape
     :param wcs:
     :returns: Image
     """
-    fim = Image()
-    fim.data = data
-    fim.wcs = wcs.deepcopy()
-    log.debug("create_image_from_array: created image of shape %s, size %.3f (GB)" % (str(fim.shape),
+    fim = Image(data=data, wcs=wcs, shape=tuple(shape))
+    log.debug("create_image_from_array: created image of shape %s, size %.3f (GB)" % (str(shape),
                                                                                       image_sizeof(fim)))
     return fim
 
@@ -88,13 +86,15 @@ def create_empty_image_like(im: Image) -> Image:
     return fim
 
 
-def export_image_to_fits(im: Image, fitsfile: str = 'imaging.fits'):
+def export_image_to_fits(im: Image, im_data = None, fitsfile: str = 'imaging.fits'):
     """ Write an image to fits
     
     :param im: Image
     :param fitsfile: Name of output fits file
     """
-    return fits.writeto(filename=fitsfile, data=im.data, header=im.wcs.to_header(), overwrite=True)
+    if im_data is None:
+        im_data = im.data.compute()
+    return fits.writeto(filename=fitsfile, data=im_data, header=im.wcs.to_header(), overwrite=True)
 
 
 def import_image_from_fits(fitsfile: str):
@@ -212,7 +212,7 @@ def reproject_image_oblique(im: Image, newwcs: WCS, shape=None, params=None):
     return create_image_from_array(rep, newwcs), create_image_from_array(foot, newwcs)
 
 
-def show_image(im: Image, fig=None, title: str = '', pol=0, chan=0):
+def show_image(im: Image, im_data=None, fig=None, title: str = '', pol=0, chan=0):
     """ Show an Image with coordinates using matplotlib
 
     :param im:
@@ -223,12 +223,14 @@ def show_image(im: Image, fig=None, title: str = '', pol=0, chan=0):
     
     if not fig:
         fig = plt.figure()
+    if im_data is None:
+        im_data = im.data.compute()
     plt.clf()
     fig.add_subplot(111, projection=im.wcs.sub(['longitude', 'latitude']))
-    if len(im.data.shape) == 4:
-        plt.imshow(numpy.real(im.data[chan, pol, :, :]), origin='lower', cmap='rainbow')
-    elif len(im.data.shape) == 2:
-        plt.imshow(numpy.real(im.data[:, :]), origin='lower', cmap='rainbow')
+    if len(im.shape) == 4:
+        plt.imshow(numpy.real(im_data[chan, pol, :, :]), origin='lower', cmap='rainbow')
+    elif len(im.shape) == 2:
+        plt.imshow(numpy.real(im_data[:, :]), origin='lower', cmap='rainbow')
     plt.xlabel('RA---SIN')
     plt.ylabel('DEC--SIN')
     plt.title(title)

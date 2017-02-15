@@ -6,13 +6,14 @@ Functions that define and manipulate images. Images are just data and a World Co
 
 import logging
 
+import dask
 import numpy
 
 from arl.image.operations import create_image_from_array
 
 log = logging.getLogger(__name__)
 
-def raster_iter(im, image_partitions=2, **kwargs):
+def raster_iter(im, image_partitions=2, delayed=False, **kwargs):
     """Create a raster_iter generator, returning images
 
     The WCS is adjusted appropriately for each raster element. Hence this is a coordinate-aware
@@ -37,6 +38,8 @@ def raster_iter(im, image_partitions=2, **kwargs):
     dy = int(im.nheight // image_partitions)
     log.info('raster: spacing of raster (%d, %d)' % (dx, dy))
 
+    slices = []
+    partition_data = []
     for y in range(0,im.nheight, dy):
         for x in range(0,im.nwidth, dx):
             log.debug('raster: partition (%d, %d) of (%d, %d)' %
@@ -46,6 +49,25 @@ def raster_iter(im, image_partitions=2, **kwargs):
             wcs = im.wcs.deepcopy()
             wcs.wcs.crpix[0] -= x
             wcs.wcs.crpix[1] -= y
+            shape = im.shape[:-2] + (dy,dx)
 
             # Yield image from slice (reference!)
-            yield create_image_from_array(im.data[..., y:y+dy, x:x+dx], wcs)
+            sl = (..., slice(y,y+dy), slice(x,x+dx))
+            partition = create_image_from_array(im.data[sl], wcs=wcs, shape=shape)
+
+            # Generate tasks for partition
+            yield partition
+
+            # Save back for later re-assembly
+            slices.append(sl)
+            partition_data.append(partition.data)
+
+    # Reassemble raster
+    im_shape = im.shape
+    @dask.delayed
+    def merge(*parts):
+        data = numpy.empty(im_shape)
+        for sl, pdata in zip(slices, parts):
+            data[sl] = pdata
+        return data
+    im.data = merge(*partition_data)

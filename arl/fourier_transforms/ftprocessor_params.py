@@ -14,6 +14,8 @@ from arl.fourier_transforms.convolutional_gridding import anti_aliasing_calculat
 from arl.fourier_transforms.variable_kernels import w_kernel_lambda
 from arl.image.iterators import *
 
+from arl.data.parameters import get_parameter
+
 log = logging.getLogger(__name__)
 
 
@@ -55,7 +57,7 @@ def get_ftprocessor_params(vis, model, **kwargs):
     support = get_parameter(kwargs, "support", 3)
     
     # Model image information
-    inchan, inpol, ny, nx = model.data.shape
+    inchan, inpol, ny, nx = model.shape
     shape = (padding * ny, padding * nx)
     
     # Visibility information

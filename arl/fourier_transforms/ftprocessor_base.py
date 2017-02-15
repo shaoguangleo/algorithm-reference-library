@@ -34,7 +34,7 @@ def shift_vis_to_image(vis, im, tangent=True, inverse=False):
     :returns: visibility with phase shift applied and phasecentre updated
 
     """
-    nchan, npol, ny, nx = im.data.shape
+    nchan, npol, ny, nx = im.shape
     # Convert the FFT definition of the phase center to world coordinates (0 relative)
     image_phasecentre = pixel_to_skycoord(ny // 2, nx // 2, im.wcs)
     
@@ -59,7 +59,7 @@ def normalize_sumwt(im: Image, sumwt):
     :param im: Image, im.data has shape [nchan, npol, ny, nx]
     :param sumwt: Sum of weights [nchan, npol]
     """
-    nchan, npol, _, _ = im.data.shape
+    nchan, npol, _, _ = im.shape
     assert nchan == sumwt.shape[0]
     assert npol == sumwt.shape[1]
     for chan in range(nchan):
@@ -128,6 +128,46 @@ def predict_wprojection(vis, model, **kwargs):
     return predict_2d_base(vis, model, kernel='wprojection', **kwargs)
 
 
+@dask.delayed
+def invert_2d_worker(svis, gcf, kernel_type, kernelname, kernel, dopsf,
+                     im_shape, vis_shape, uvscale, vmap, padding, cache):
+
+    nchan, npol, ny, nx = im_shape
+
+    # uvw is in metres, v.frequency / c.value converts to wavelengths, the cellsize converts to phase
+    # Optionally pad to control aliasing
+    imgridpad = numpy.zeros([nchan, npol, padding * ny, padding * nx], dtype='complex')
+    uvw = svis.data['uvw']
+    if kernel_type == 'variable':
+        if dopsf:
+            weights = numpy.ones(vis_shape)
+            imgridpad, sumwt = variable_kernel_grid(kernel, imgridpad, uvw, uvscale, weights,
+                                                    svis.data['imaging_weight'], vmap)
+        else:
+            imgridpad, sumwt = variable_kernel_grid(kernel, imgridpad, uvw, uvscale, svis.data['vis'],
+                                                    svis.data['imaging_weight'], vmap)
+    else:
+        if dopsf:
+            weights = numpy.ones(vis_shape)
+            if kernelname == 'box':
+                imgridpad, sumwt = box_grid(kernel, imgridpad, uvw, uvscale, weights, svis.data['imaging_weight'])
+            else:
+                imgridpad, sumwt = fixed_kernel_grid(kernel, imgridpad, uvw, uvscale, weights,
+                                                     svis.data['imaging_weight'], vmap)
+        else:
+            if kernelname == 'box':
+                imgridpad, sumwt = box_grid(kernel, imgridpad, uvw, uvscale, svis.data['vis'],
+                                            svis.data['imaging_weight'])
+            else:
+                imgridpad, sumwt = fixed_kernel_grid(kernel, imgridpad, uvw, uvscale, svis.data['vis'],
+                                                     svis.data['imaging_weight'], vmap)
+
+    # Normalise weights for consistency with transform
+    sumwt /= float(padding * padding * nx * ny)
+    log_cacheinfo(cache)
+
+    return extract_mid(numpy.real(ifft(imgridpad)) * gcf, npixel=nx), sumwt
+
 def invert_2d_base(vis, im, dopsf=False, **kwargs):
     """ Invert using 2D convolution function, including w projection
 
@@ -148,47 +188,14 @@ def invert_2d_base(vis, im, dopsf=False, **kwargs):
     shvis = shift_vis_to_image(svis, im, tangent=True, inverse=False)
     svis, _ = compress_visibility(shvis, im, dopsf=dopsf, **kwargs)
     
-    nchan, npol, ny, nx = im.data.shape
-    
+    # Determine parameters for worker, run
     vmap, gcf, kernel_type, kernelname, kernel, padding, oversampling, support, cellsize, \
-    fov, uvscale, cache = get_ftprocessor_params(vis, im, **kwargs)
-    
-    # uvw is in metres, v.frequency / c.value converts to wavelengths, the cellsize converts to phase
-    # Optionally pad to control aliasing
-    imgridpad = numpy.zeros([nchan, npol, padding * ny, padding * nx], dtype='complex')
-    uvw = svis.data['uvw']
-    if kernel_type == 'variable':
-        if dopsf:
-            weights = numpy.ones_like(svis.data['vis'])
-            imgridpad, sumwt = variable_kernel_grid(kernel, imgridpad, uvw, uvscale, weights,
-                                                    svis.data['imaging_weight'], vmap)
-        else:
-            imgridpad, sumwt = variable_kernel_grid(kernel, imgridpad, uvw, uvscale, svis.data['vis'],
-                                                    svis.data['imaging_weight'], vmap)
-    else:
-        if dopsf:
-            weights = numpy.ones_like(svis.data['vis'])
-            if kernelname == 'box':
-                imgridpad, sumwt = box_grid(kernel, imgridpad, uvw, uvscale, weights, svis.data['imaging_weight'])
-            else:
-                imgridpad, sumwt = fixed_kernel_grid(kernel, imgridpad, uvw, uvscale, weights,
-                                                     svis.data['imaging_weight'], vmap)
-        else:
-            if kernelname == 'box':
-                imgridpad, sumwt = box_grid(kernel, imgridpad, uvw, uvscale, svis.data['vis'],
-                                            svis.data['imaging_weight'])
-            else:
-                imgridpad, sumwt = fixed_kernel_grid(kernel, imgridpad, uvw, uvscale, svis.data['vis'],
-                                                     svis.data['imaging_weight'], vmap)
-    
-    imgrid = extract_mid(numpy.real(ifft(imgridpad)) * gcf, npixel=nx)
-    
-    # Normalise weights for consistency with transform
-    sumwt /= float(padding * padding * nx * ny)
+      fov, uvscale, cache = get_ftprocessor_params(vis, im, **kwargs)
+    imgrid_sumwt = invert_2d_worker(svis, gcf, kernel_type, kernelname, kernel, dopsf,
+                                    im.shape, vis.shape, uvscale, vmap, padding, cache)
 
-    log_cacheinfo(cache)
-
-    return create_image_from_array(imgrid, im.wcs), sumwt
+    # Re-assemble image
+    return create_image_from_array(imgrid_sumwt[0], im.shape, im.wcs), imgrid_sumwt[1]
 
 
 def invert_2d(vis, im, dopsf=False, **kwargs):
@@ -240,15 +247,19 @@ def invert_by_image_partitions(vis, im, image_iterator=raster_iter, dopsf=False,
     i = 0
     nchan, npol, _, _ = im.shape
     totalwt = numpy.zeros([nchan, npol])
+
+    @dask.delayed
+    def check_empty(im_data, error_msg):
+        assert numpy.max(numpy.abs(im_data)), error_msg
+        return im_data
+
     for dpatch in image_iterator(im, **kwargs):
         result, sumwt = invert_function(vis, dpatch, dopsf, **kwargs)
         totalwt = sumwt
-        # Ensure that we fill in the elements of dpatch instead of creating a new numpy arrray
-        dpatch.data[...] = result.data[...]
-        assert numpy.max(numpy.abs(dpatch.data)), "Partition image %d appears to be empty" % i
+        dpatch.data = check_empty(result.data, "Partition image %d appears to be empty" % i)
         i += 1
-    assert numpy.max(numpy.abs(im.data)), "Output image appears to be empty"
-    
+    im.data = check_empty(im.data, "Output image appears to be empty")
+
     # Loose thread here: we have to assume that all patchs have the same sumwt
     return im, totalwt
 
@@ -348,7 +359,7 @@ def weight_visibility(vis, im, **kwargs):
     
     weighting = get_parameter(kwargs, "weighting", "uniform")
     if weighting == 'uniform':
-        vis.data['imaging_weight'], density, densitygrid = weight_gridding(im.data.shape, vis.data['uvw'], uvscale,
+        vis.data['imaging_weight'], density, densitygrid = weight_gridding(im.shape, vis.data['uvw'], uvscale,
                                                                            vis.data['weight'], weighting, vmap)
     elif weighting == 'natural':
         vis.data['imaging_weight'] = vis.data['weight']
@@ -433,7 +444,7 @@ def create_image_from_visibility(vis, **kwargs):
     w.wcs.radesys = get_parameter(kwargs, 'frame', 'ICRS')
     w.wcs.equinox = get_parameter(kwargs, 'equinox', 2000.0)
     
-    return create_image_from_array(numpy.zeros(shape), wcs=w)
+    return create_image_from_array(numpy.zeros(shape), wcs=w, shape=shape)
 
 
 def create_w_term_image(vis, w=None, **kwargs):
@@ -449,8 +460,8 @@ def create_w_term_image(vis, w=None, **kwargs):
     
     im = create_image_from_visibility(vis, **kwargs)
     cellsize = abs(im.wcs.wcs.cdelt[0]) * numpy.pi / 180.0
-    _, _, _, npixel = im.data.shape
-    im.data = w_beam(npixel, npixel * cellsize, w=w)
+    _, _, _, npixel = im.shape
+    im.data = dask.delayed(w_beam)(npixel, npixel * cellsize, w=w)
     
     fresnel = w * (0.5 * npixel * cellsize) ** 2
     log.info('create_w_term_image: Fresnel number for median w and this field of view and sampling = '
