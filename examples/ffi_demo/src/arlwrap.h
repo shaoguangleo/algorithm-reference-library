@@ -66,6 +66,12 @@ typedef struct {
 
 typedef struct {int nant, nbases;} ant_t;
 
+typedef struct {double ra;
+		double dec;
+		char *frame;
+		char *equinox;} ARLPhasecentre;
+
+
 void helper_get_image_shape(const double *frequency, double cellsize,
 		int *shape);
 void helper_get_nbases(char *, ant_t *);
